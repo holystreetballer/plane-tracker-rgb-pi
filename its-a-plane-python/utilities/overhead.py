@@ -3,341 +3,149 @@ from threading import Thread, Lock
 from time import sleep
 import math
 from typing import Optional, Tuple
-from config import DISTANCE_UNITS
 
-from requests.exceptions import ConnectionError
-from urllib3.exceptions import NewConnectionError
-from urllib3.exceptions import MaxRetryError
+# SFO coordinates and bounds
+SFO_LAT = 37.6213
+SFO_LON = -122.3790
+SFO_ZONE = {
+    "tl_y": SFO_LAT + 0.1,  # Add 0.1 degrees for coverage
+    "tl_x": SFO_LON - 0.1,
+    "br_y": SFO_LAT - 0.1,
+    "br_x": SFO_LON + 0.1
+}
 
-try:
-    # Attempt to load config data
-    from config import MIN_ALTITUDE
+# Runway parameters
+RUNWAY_28_THRESHOLD = {
+    "28L": {"lat": 37.6161, "lon": -122.3580},
+    "28R": {"lat": 37.6188, "lon": -122.3530},
+    "10L": {"lat": 37.6213, "lon": -122.3790},  # Same as 28R other end
+    "10R": {"lat": 37.6191, "lon": -122.3795}   # Same as 28L other end
+}
 
-except (ModuleNotFoundError, NameError, ImportError):
-    # If there's no config data
-    MIN_ALTITUDE = 0  # feet
-
+# Configuration
+MAX_FLIGHT_LOOKUP = 10
+LANDING_ALTITUDE_THRESHOLD = 1000  # feet
+TAKEOFF_ALTITUDE_THRESHOLD = 3000  # feet
+RUNWAY_PROXIMITY_THRESHOLD = 0.01  # degrees (rough approximation)
 RETRIES = 3
 RATE_LIMIT_DELAY = 1
-MAX_FLIGHT_LOOKUP = 5
-MAX_ALTITUDE = 100000  # feet
-EARTH_RADIUS_M = 3958.8  # Earth's radius in miles
-BLANK_FIELDS = ["", "N/A", "NONE"]
 
-try:
-    # Attempt to load config data
-    from config import ZONE_HOME, LOCATION_HOME
-
-    ZONE_DEFAULT = ZONE_HOME
-    LOCATION_DEFAULT = LOCATION_HOME
-
-except (ModuleNotFoundError, NameError, ImportError):
-    # If there's no config data
-    ZONE_DEFAULT = {"tl_y": 62.61, "tl_x": -13.07, "br_y": 49.71, "br_x": 3.46}
-    LOCATION_DEFAULT = [51.509865, -0.118092, EARTH_RADIUS_M]
-    
-def polar_to_cartesian(lat, long, alt):
-        DEG2RAD = math.pi / 180
-        return [
-            alt * math.cos(DEG2RAD * lat) * math.sin(DEG2RAD * long),
-            alt * math.sin(DEG2RAD * lat),
-            alt * math.cos(DEG2RAD * lat) * math.cos(DEG2RAD * long),
-        ]
-
-
-def distance_from_flight_to_home(flight, home=LOCATION_DEFAULT):
-    try:
-        # Convert latitude and longitude from degrees to radians
-        lat1, lon1 = math.radians(flight.latitude), math.radians(flight.longitude)
-        lat2, lon2 = math.radians(home[0]), math.radians(home[1])
-
-        # Differences in coordinates
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-
-        # Haversine formula
-        a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-        # Haversine distance in miles using the defined Earth radius
-        dist_miles = EARTH_RADIUS_M * c
-
-        # Convert distance units if needed
-        if DISTANCE_UNITS == "metric":
-            dist_km = dist_miles * 1.609  # Convert miles to kilometers
-            return dist_km
-        else:
-            return dist_miles
-
-    except AttributeError:
-        # on error say it's far away
-        return 1e6
-               
-def plane_bearing(flight, home=LOCATION_DEFAULT):
-  # Convert latitude and longitude to radians
-  lat1 = math.radians(home[0])
-  long1 = math.radians(home[1])
-  lat2 = math.radians(flight.latitude)
-  long2 = math.radians(flight.longitude)
-
-  # Calculate the bearing
-  bearing = math.atan2(
-      math.sin(long2 - long1) * math.cos(lat2),
-      math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(long2 - long1)
-  )
-
-  # Convert the bearing to degrees
-  bearing = math.degrees(bearing)
-
-  # Make sure the bearing is positives
-  return (bearing + 360) % 360
-  
-def degrees_to_cardinal(d):
-    '''
-    note: this is highly approximate...
-    '''
-    dirs = ["N", "NE",  "E",  "SE", 
-            "S",  "SW",  "W",  "NW",]
-    ix = int((d + 22.5)/45)
-    return dirs[ix % 8]
-
-def distance_from_flight_to_origin(flight, origin_latitude, origin_longitude, origin_altitude):
-    if hasattr(flight, 'latitude') and hasattr(flight, 'longitude') and hasattr(flight, 'altitude'):
-        try:
-            # Convert latitude and longitude from degrees to radians
-            lat1, lon1 = math.radians(flight.latitude), math.radians(flight.longitude)
-            lat2, lon2 = math.radians(origin_latitude), math.radians(origin_longitude)
-
-            # Differences in coordinates
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-
-            # Haversine formula
-            a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-            # Haversine distance in miles using the defined Earth radius
-            dist_miles = EARTH_RADIUS_M * c
-
-            # Convert distance units if needed
-            if DISTANCE_UNITS == "metric":
-                dist_km = dist_miles * 1.609  # Convert miles to kilometers
-                return dist_km
-            else:
-                return dist_miles
-        except Exception as e:
-            print("Error:", e)
-            return None
-    else:
-        print("Flight data is missing required attributes: latitude, longitude, or altitude")
-        return None
-
-def distance_from_flight_to_destination(flight, destination_latitude, destination_longitude, destination_altitude):
-    if hasattr(flight, 'latitude') and hasattr(flight, 'longitude') and hasattr(flight, 'altitude'):
-        try:
-            # Convert latitude and longitude from degrees to radians
-            lat1, lon1 = math.radians(flight.latitude), math.radians(flight.longitude)
-            lat2, lon2 = math.radians(destination_latitude), math.radians(destination_longitude)
-
-            # Differences in coordinates
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-
-            # Haversine formula
-            a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-            # Haversine distance in miles using the defined Earth radius
-            dist_miles = EARTH_RADIUS_M * c
-
-            # Convert distance units if needed
-            if DISTANCE_UNITS == "metric":
-                dist_km = dist_miles * 1.609  # Convert miles to kilometers
-                return dist_km
-            else:
-                return dist_miles
-        except Exception as e:
-            print("Error:", e)
-            return None
-    else:
-        print("Flight data is missing required attributes: latitude, longitude, or altitude")
-        return None
-
-
-class Overhead:
+class SFORunwayTracker:
     def __init__(self):
         self._api = FlightRadar24API()
         self._lock = Lock()
         self._data = []
         self._new_data = False
         self._processing = False
+        self._active_runways = ["28L", "28R"]  # Default to 28L/R configuration
+
+    def determine_runway_config(self, flights):
+        """Determine if we're using 28 L/R or 10 L/R based on flight patterns"""
+        west_operations = 0
+        east_operations = 0
+        
+        for flight in flights:
+            if hasattr(flight, 'heading'):
+                if 260 <= flight.heading <= 300:  # Landing/Taking off on 28L/R
+                    west_operations += 1
+                elif 80 <= flight.heading <= 120:  # Landing/Taking off on 10L/R
+                    east_operations += 1
+        
+        if east_operations > west_operations:
+            self._active_runways = ["10L", "10R"]
+        else:
+            self._active_runways = ["28L", "28R"]
+
+    def determine_operation(self, flight, prev_altitude=None):
+        """Determine if aircraft is taking off or landing"""
+        if not hasattr(flight, 'altitude') or not hasattr(flight, 'vertical_speed'):
+            return None
+            
+        if flight.altitude <= LANDING_ALTITUDE_THRESHOLD and flight.vertical_speed < 0:
+            return "Landing"
+        elif flight.altitude <= TAKEOFF_ALTITUDE_THRESHOLD and flight.vertical_speed > 0:
+            return "Takeoff"
+        return None
+
+    def determine_runway(self, flight):
+        """Determine which runway the aircraft is using"""
+        if not hasattr(flight, 'latitude') or not hasattr(flight, 'longitude'):
+            return None
+            
+        closest_runway = None
+        min_distance = float('inf')
+        
+        for runway in self._active_runways:
+            threshold = RUNWAY_28_THRESHOLD[runway]
+            distance = math.sqrt(
+                (flight.latitude - threshold['lat'])**2 + 
+                (flight.longitude - threshold['lon'])**2
+            )
+            if distance < min_distance:
+                min_distance = distance
+                closest_runway = runway
+                
+        if min_distance <= RUNWAY_PROXIMITY_THRESHOLD:
+            return closest_runway
+        return None
 
     def grab_data(self):
+        """Start asynchronous data collection"""
         Thread(target=self._grab_data).start()
 
     def _grab_data(self):
-        # Mark data as old
+        """Collect data about flights near SFO runways"""
         with self._lock:
             self._new_data = False
             self._processing = True
 
         data = []
-
-        # Grab flight details
+        
         try:
-            bounds = self._api.get_bounds(ZONE_DEFAULT)
+            bounds = self._api.get_bounds(SFO_ZONE)
             flights = self._api.get_flights(bounds=bounds)
-
-            # Sort flights by closest first
-            flights = [
-                f
-                for f in flights
-                if f.altitude < MAX_ALTITUDE and f.altitude > MIN_ALTITUDE
-            ]
-            flights = sorted(flights, key=lambda f: distance_from_flight_to_home(f))
-
+            
+            # Determine current runway configuration
+            self.determine_runway_config(flights)
+            
+            # Filter and process flights
             for flight in flights[:MAX_FLIGHT_LOOKUP]:
                 retries = RETRIES
-
+                
                 while retries:
-                    # Rate limit protection
-                    sleep(RATE_LIMIT_DELAY)
-
-                    # Grab and store details
                     try:
                         details = self._api.get_flight_details(flight)
-
-                        # Get plane type
-                        try:
-                            plane = details["aircraft"]["model"]["code"]
-                        except (KeyError, TypeError):
-                            plane = ""
-
-                        # Tidy up what we pass along
-                        plane = plane if not (plane.upper() in BLANK_FIELDS) else ""
-
-                        origin = (
-                            flight.origin_airport_iata
-                            if not (flight.origin_airport_iata.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        destination = (
-                            flight.destination_airport_iata
-                            if not (flight.destination_airport_iata.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        callsign = (
-                            flight.callsign
-                            if not (flight.callsign.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        # Get airline type
-                        try:
-                            airline = details["airline"]["name"]
-                        except (KeyError, TypeError):
-                            airline = ""
-                            
-                        # Get departure and arrival times
-                        try:
-                            time_scheduled_departure = details["time"]["scheduled"]["departure"]
-                            time_scheduled_arrival = details["time"]["scheduled"]["arrival"]
-                            time_real_departure = details["time"]["real"]["departure"]
-                            time_estimated_arrival = details["time"]["estimated"]["arrival"]
-                        except (KeyError, TypeError):
-                            time_scheduled_departure = None
-                            time_scheduled_arrival = None
-                            time_real_departure = None
-                            time_estimated_arrival = None
-                            
-                        # Extract origin airport coordinates
-                        origin_latitude = None
-                        origin_longitude = None
-                        origin_altitude = None
-                        if details['airport']['origin'] is not None:
-                            origin_latitude = details['airport']['origin']['position']['latitude']
-                            origin_longitude = details['airport']['origin']['position']['longitude']
-                            origin_altitude = details['airport']['origin']['position']['altitude']
-                            #print("Origin Coordinates:", origin_latitude, origin_longitude, origin_altitude)
-
-                        # Extract destination airport coordinates
-                        destination_latitude = None
-                        destination_longitude = None
-                        destination_altitude = None
-                        if details['airport']['destination'] is not None:
-                            destination_latitude = details['airport']['destination']['position']['latitude']
-                            destination_longitude = details['airport']['destination']['position']['longitude']
-                            destination_altitude = details['airport']['destination']['position']['altitude']
-                            #print("Destination Coordinates:", destination_latitude, destination_longitude, destination_altitude)
-
-                        # Calculate distances using modified functions
-                        distance_origin = 0
-                        distance_destination = 0
-
-                        if origin_latitude is not None:
-                            distance_origin = distance_from_flight_to_origin(
-                                flight,
-                                origin_latitude,
-                                origin_longitude,
-                                origin_altitude
-                            )
-
-                        if destination_latitude is not None:
-                            distance_destination = distance_from_flight_to_destination(
-                                flight,
-                                destination_latitude,
-                                destination_longitude,
-                                destination_altitude
-                            )
-                            
-
-                        # Get owner icao
-                        try:
-                            owner_icao = details["owner"]["code"]["icao"]
-                        except (KeyError, TypeError):
-                            owner_icao = (
-                                flight.airline_icao
-                                if not (flight.airline_icao.upper() in BLANK_FIELDS)
-                                else "")
-
-                        owner_iata = flight.airline_iata or "N/A"
-                            
-                        data.append(
-                            {
-                                "airline": airline,
-                                "plane": plane,
-                                "origin": origin,
-                                "owner_iata":owner_iata,
-                                "owner_icao": owner_icao,
-                                "destination": destination,
-                                "time_scheduled_departure": time_scheduled_departure,
-                                "time_scheduled_arrival": time_scheduled_arrival,
-                                "time_real_departure": time_real_departure,
-                                "time_estimated_arrival": time_estimated_arrival,
+                        operation = self.determine_operation(flight)
+                        runway = self.determine_runway(flight)
+                        
+                        if operation and runway:
+                            flight_data = {
+                                "callsign": flight.callsign,
+                                "operation": operation,
+                                "runway": runway,
+                                "aircraft": details.get("aircraft", {}).get("model", {}).get("code", "Unknown"),
+                                "airline": details.get("airline", {}).get("name", "Unknown"),
+                                "altitude": flight.altitude,
                                 "vertical_speed": flight.vertical_speed,
-                                "callsign": callsign,
-                                "distance_origin": distance_origin,
-                                "distance_destination": distance_destination,
-                                "distance": distance_from_flight_to_home(flight),
-                                "direction": degrees_to_cardinal(plane_bearing(flight)),
+                                "heading": flight.heading
                             }
-                        )
-                    
+                            data.append(flight_data)
                         break
-
+                        
                     except (KeyError, AttributeError):
                         retries -= 1
+                        sleep(RATE_LIMIT_DELAY)
 
             with self._lock:
                 self._new_data = True
                 self._processing = False
                 self._data = data
-
-        except (ConnectionError, NewConnectionError, MaxRetryError):
-            self._new_data = False
-            self._processing = False
+                
+        except Exception as e:
+            print(f"Error fetching flight data: {e}")
+            with self._lock:
+                self._new_data = False
+                self._processing = False
 
     @property
     def new_data(self):
@@ -356,17 +164,26 @@ class Overhead:
             return self._data
 
     @property
-    def data_is_empty(self):
-        return len(self._data) == 0
+    def active_runways(self):
+        return self._active_runways
 
-
-# Main function
+# Example usage
 if __name__ == "__main__":
-
-    o = Overhead()
-    o.grab_data()
-    while not o.new_data:
-        print("processing...")
-        sleep(1)
-
-    print(o.data)
+    tracker = SFORunwayTracker()
+    
+    while True:
+        tracker.grab_data()
+        while tracker.processing:
+            print("Processing...")
+            sleep(1)
+            
+        if tracker.new_data:
+            print(f"\nActive runway configuration: {tracker.active_runways}")
+            print("\nCurrent runway operations:")
+            for operation in tracker.data:
+                print(f"{operation['callsign']} - {operation['operation']} on {operation['runway']}")
+                print(f"Aircraft: {operation['aircraft']} ({operation['airline']})")
+                print(f"Altitude: {operation['altitude']}ft, Vertical Speed: {operation['vertical_speed']}ft/min")
+                print("---")
+        
+        sleep(5)  # Wait before next update
